@@ -1,0 +1,57 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: build/server.Dockerfile
+    networks:
+      net_server:
+        ipv4_address: 172.21.0.2
+
+  proxy:
+    build:
+      context: .
+      dockerfile: build/proxy.Dockerfile
+    # Packet-level gateway: needs raw sockets (NET_RAW for pcap capture/inject)
+    # and NET_ADMIN (iptables RST-drop). IP forwarding is disabled so the kernel
+    # won't route the client's server-bound packets — the Go proxy handles them.
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    sysctls:
+      net.ipv4.ip_forward: "0"
+    # Two NICs: one per subnet, both addressed .3.
+    networks:
+      net_client:
+        ipv4_address: 172.30.0.3
+      net_server:
+        ipv4_address: 172.21.0.3
+    depends_on: [server]
+
+  client:
+    build:
+      context: .
+      dockerfile: build/client.Dockerfile
+    # NET_ADMIN lets the entrypoint replace the default route with the proxy.
+    cap_add:
+      - NET_ADMIN
+    # Client and server share no network, so Docker DNS can't resolve "server".
+    # Static host entry maps the hostname to the server's real IP; on the wire the
+    # dst IP is the real server, and the app stays unaware of the proxy.
+    extra_hosts:
+      - "server:172.21.0.2"
+    networks:
+      net_client:
+        ipv4_address: 172.30.0.4
+    depends_on: [server, proxy]
+
+networks:
+  net_client:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  net_server:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/24
