@@ -65,21 +65,19 @@ func handlePacket(handle *pcap.Handle, cfg Config, pkt gopacket.Packet) error {
 	if ipErr != nil {
 		return fmt.Errorf("Error in retrieving ip %v", ipErr)
 	}
-	isFromClient := isFromClient(cfg, pktIp)
-
-	var rewritten []byte;
-	var err error;
-	if isFromClient {
-		rewritten, err = rewritePkt(cfg, pkt, &pktIp.SrcIP)
-	} else {
-		rewritten, err = rewritePkt(cfg, pkt, &pktIp.DstIP)
-	}
-
+	rewritten, err := rewriteForDirection(cfg, pkt, pktIp)
 	if err != nil {
 		return fmt.Errorf("Error in rewite %v", err)
 	}
 
 	return forward(handle, rewritten)
+}
+
+func rewriteForDirection(cfg Config, pkt gopacket.Packet, pktIp *layers.IPv4) ([]byte, error) {
+	if isFromClient(cfg, pktIp) {
+		return rewritePkt(pkt, &pktIp.SrcIP, cfg.proxyEgressIP)
+	}
+	return rewritePkt(pkt, &pktIp.DstIP, cfg.clientIP)
 }
 
 func getPacketIp(pkt gopacket.Packet) (*layers.IPv4, error) {
@@ -99,12 +97,12 @@ func isFromClient(cfg Config, pktIp *layers.IPv4) bool {
 	return cfg.clientIP.Equal(pktIp.SrcIP)
 }
 
-func rewritePkt(cfg Config, pkt gopacket.Packet, targetIP *net.IP) ([]byte, error) {
-	*targetIP = cfg.proxyEgressIP
+func rewritePkt(pkt gopacket.Packet, targetIP *net.IP, newIP net.IP) ([]byte, error) {
+	*targetIP = newIP
 
 	data, err := serialize(pkt)
 	if err != nil {
-		return nil, fmt.Errorf("snatOutbound serialize: %w", err)
+		return nil, fmt.Errorf("serialize: %w", err)
 	}
 
 	return data, nil
