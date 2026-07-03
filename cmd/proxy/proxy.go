@@ -16,24 +16,22 @@ import (
 	"github.com/google/gopacket/pcapgo"
 )
 
-// Config holds all environmental networking settings discovered dynamically.
 type Config struct {
 	clientInterface string
 	serverInterface string
 
-	clientIP      net.IP // Client container's IP (e.g. 172.30.0.4)
-	serverIP      net.IP // Server container's IP (e.g. 172.21.0.2)
-	proxyEgressIP net.IP // Proxy's IP on the server-facing subnet (e.g. 172.21.0.3)
+	clientIP      net.IP
+	serverIP      net.IP
+	proxyEgressIP net.IP
 
-	proxyClientMAC net.HardwareAddr // Proxy's client-facing MAC address
-	proxyServerMAC net.HardwareAddr // Proxy's server-facing MAC address
+	proxyClientMAC net.HardwareAddr
+	proxyServerMAC net.HardwareAddr
 
 	snapshotLen int32
 	promiscuous bool
 	timeout     time.Duration
 }
 
-// pcapDump wraps file-based packet logging with a mutex to ensure concurrency safety.
 type pcapDump struct {
 	mu sync.Mutex
 	f  *os.File
@@ -63,8 +61,6 @@ func (d *pcapDump) close() error {
 	return d.f.Close()
 }
 
-// NATProxy acts as our packet-level L3 NAT gateway.
-// It intercepts client/server traffic, translates IPs/MACs in-flight, and forwards them.
 type NATProxy struct {
 	cfg          Config
 	clientHandle *pcap.Handle
@@ -75,9 +71,7 @@ type NATProxy struct {
 	rewDump      *pcapDump
 }
 
-// NewNATProxy initializes the networking environment, maps subnets, and resolves host MACs.
 func NewNATProxy() (*NATProxy, error) {
-	// 1. Discover IPs & networks dynamically
 	clientIP := resolveContainerIP("client")
 	serverIP := resolveContainerIP("server")
 
@@ -112,7 +106,6 @@ func NewNATProxy() (*NATProxy, error) {
 		timeout:         pcap.BlockForever,
 	}
 
-	// 2. Open pcap handles for capture & packet injection
 	clientHandle, err := pcap.OpenLive(cfg.clientInterface, cfg.snapshotLen, cfg.promiscuous, cfg.timeout)
 	if err != nil {
 		return nil, fmt.Errorf("open client capture handle: %w", err)
@@ -124,13 +117,11 @@ func NewNATProxy() (*NATProxy, error) {
 		return nil, fmt.Errorf("open server capture handle: %w", err)
 	}
 
-	// 3. Resolve destination hardware MACs via active ARP queries
 	log.Printf("[Proxy] Resolving Client MAC (%s) and Server MAC (%s)...", cfg.clientIP, cfg.serverIP)
 	clientMAC := getMACWithRetry(cfg.clientIP)
 	serverMAC := getMACWithRetry(cfg.serverIP)
 	log.Printf("[Proxy] Resolved MACs - Client: %s, Server: %s", clientMAC, serverMAC)
 
-	// 4. Set up file dumps for packet recording
 	origDump, err := newPcapDump("original.pcap", layers.LinkTypeEthernet)
 	if err != nil {
 		clientHandle.Close()
@@ -157,7 +148,6 @@ func NewNATProxy() (*NATProxy, error) {
 	}, nil
 }
 
-// Close gracefully releases all resources, files, and socket descriptors.
 func (p *NATProxy) Close() {
 	p.clientHandle.Close()
 	p.serverHandle.Close()
@@ -165,30 +155,27 @@ func (p *NATProxy) Close() {
 	p.rewDump.close()
 }
 
-// Run executes the dual-directional capture loops concurrently.
 func (p *NATProxy) Run() {
 	log.Printf("[Proxy] Starting packet-forwarding loops. Client interface: %s, Server interface: %s", p.cfg.clientInterface, p.cfg.serverInterface)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Path 1: Client -> Server
 	go func() {
 		defer wg.Done()
 		src := gopacket.NewPacketSource(p.clientHandle, p.clientHandle.LinkType())
 		for pkt := range src.Packets() {
-			if err := p.forwardClientToServer(pkt); err != nil {
+			if err := p.forwardPacket(pkt, p.cfg.clientIP, true, p.cfg.proxyEgressIP, p.cfg.proxyServerMAC, p.serverMAC, p.serverHandle); err != nil {
 				log.Printf("[Proxy] client -> server route error: %v", err)
 			}
 		}
 	}()
 
-	// Path 2: Server -> Client
 	go func() {
 		defer wg.Done()
 		src := gopacket.NewPacketSource(p.serverHandle, p.serverHandle.LinkType())
 		for pkt := range src.Packets() {
-			if err := p.forwardServerToClient(pkt); err != nil {
+			if err := p.forwardPacket(pkt, p.cfg.serverIP, false, p.cfg.clientIP, p.cfg.proxyClientMAC, p.clientMAC, p.clientHandle); err != nil {
 				log.Printf("[Proxy] server -> client route error: %v", err)
 			}
 		}
@@ -197,16 +184,13 @@ func (p *NATProxy) Run() {
 	wg.Wait()
 }
 
-// forwardClientToServer captures packets from the client interface, translates Src IP/MAC,
-// and routes them out to the server network.
-func (p *NATProxy) forwardClientToServer(pkt gopacket.Packet) error {
+func (p *NATProxy) forwardPacket(pkt gopacket.Packet, srcFilter net.IP, modifySource bool, targetIP net.IP, srcMAC, dstMAC net.HardwareAddr, outHandle *pcap.Handle) error {
 	ip, err := getIPv4Layer(pkt)
 	if err != nil || ip == nil {
 		return err
 	}
 
-	// Capture filter: ignore packets not originating directly from the client container
-	if !ip.SrcIP.Equal(p.cfg.clientIP) {
+	if !ip.SrcIP.Equal(srcFilter) {
 		return nil
 	}
 
@@ -214,8 +198,14 @@ func (p *NATProxy) forwardClientToServer(pkt gopacket.Packet) error {
 		return fmt.Errorf("pcap original dump: %w", err)
 	}
 
-	// Rewrite source IP to proxy server IP, rewrite Src MAC to proxy, Dst MAC to server
-	rewritten, err := p.rewritePacket(pkt, &ip.SrcIP, p.cfg.proxyEgressIP, p.cfg.proxyServerMAC, p.serverMAC)
+	var ipField *net.IP
+	if modifySource {
+		ipField = &ip.SrcIP
+	} else {
+		ipField = &ip.DstIP
+	}
+
+	rewritten, err := p.rewritePacket(pkt, ipField, targetIP, srcMAC, dstMAC)
 	if err != nil {
 		return fmt.Errorf("rewrite packet: %w", err)
 	}
@@ -229,45 +219,9 @@ func (p *NATProxy) forwardClientToServer(pkt gopacket.Packet) error {
 		return fmt.Errorf("pcap rewritten dump: %w", err)
 	}
 
-	return p.serverHandle.WritePacketData(rewritten)
+	return outHandle.WritePacketData(rewritten)
 }
 
-// forwardServerToClient captures packets from the server interface, translates Dst IP/MAC,
-// and routes them back to the client network.
-func (p *NATProxy) forwardServerToClient(pkt gopacket.Packet) error {
-	ip, err := getIPv4Layer(pkt)
-	if err != nil || ip == nil {
-		return err
-	}
-
-	// Capture filter: ignore packets not originating directly from the server container
-	if !ip.SrcIP.Equal(p.cfg.serverIP) {
-		return nil
-	}
-
-	if err := p.origDump.writePacket(pkt.Metadata().CaptureInfo, pkt.Data()); err != nil {
-		return fmt.Errorf("pcap original dump: %w", err)
-	}
-
-	// Rewrite destination IP to client IP, rewrite Src MAC to proxy, Dst MAC to client
-	rewritten, err := p.rewritePacket(pkt, &ip.DstIP, p.cfg.clientIP, p.cfg.proxyClientMAC, p.clientMAC)
-	if err != nil {
-		return fmt.Errorf("rewrite packet: %w", err)
-	}
-
-	ci := gopacket.CaptureInfo{
-		Timestamp:     pkt.Metadata().Timestamp,
-		CaptureLength: len(rewritten),
-		Length:        len(rewritten),
-	}
-	if err := p.rewDump.writePacket(ci, rewritten); err != nil {
-		return fmt.Errorf("pcap rewritten dump: %w", err)
-	}
-
-	return p.clientHandle.WritePacketData(rewritten)
-}
-
-// rewritePacket updates L3 IP and L2 Ethernet MAC fields and serializes the updated packet.
 func (p *NATProxy) rewritePacket(pkt gopacket.Packet, ipField *net.IP, newIP net.IP, srcMAC, dstMAC net.HardwareAddr) ([]byte, error) {
 	*ipField = newIP
 
@@ -280,18 +234,6 @@ func (p *NATProxy) rewritePacket(pkt gopacket.Packet, ipField *net.IP, newIP net
 
 	return serialize(pkt)
 }
-
-func main() {
-	proxy, err := NewNATProxy()
-	if err != nil {
-		log.Fatalf("[Proxy] Initialization failure: %v", err)
-	}
-	defer proxy.Close()
-
-	proxy.Run()
-}
-
-// Helper Utilities
 
 func findInterfaceForTarget(target net.IP) (string, net.IP, error) {
 	ifaces, err := net.Interfaces()
@@ -344,7 +286,7 @@ func getMACFromARP(ip net.IP) (net.HardwareAddr, error) {
 }
 
 func getMACWithRetry(ip net.IP) net.HardwareAddr {
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		mac, err := getMACFromARP(ip)
 		if err == nil {
 			return mac
@@ -353,8 +295,7 @@ func getMACWithRetry(ip net.IP) net.HardwareAddr {
 		triggerARP(ip)
 		time.Sleep(500 * time.Millisecond)
 	}
-	log.Fatalf("[Proxy] failed to resolve MAC address for %v", ip)
-	return nil
+	panic(fmt.Sprintf("[Proxy] failed to resolve MAC address for %v", ip))
 }
 
 func getIPv4Layer(pkt gopacket.Packet) (*layers.IPv4, error) {
@@ -370,12 +311,12 @@ func getIPv4Layer(pkt gopacket.Packet) (*layers.IPv4, error) {
 }
 
 func serialize(pkt gopacket.Packet) ([]byte, error) {
-	if net := pkt.NetworkLayer(); net != nil {
+	if netLayer := pkt.NetworkLayer(); netLayer != nil {
 		switch t := pkt.TransportLayer().(type) {
 		case *layers.TCP:
-			t.SetNetworkLayerForChecksum(net)
+			t.SetNetworkLayerForChecksum(netLayer)
 		case *layers.UDP:
-			t.SetNetworkLayerForChecksum(net)
+			t.SetNetworkLayerForChecksum(netLayer)
 		}
 	}
 
