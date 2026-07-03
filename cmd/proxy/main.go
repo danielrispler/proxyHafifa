@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
+	"github.com/google/gopacket/pcapgo"
 )
 
 type Config struct {
@@ -21,6 +23,32 @@ type Config struct {
 	Timeout       time.Duration
 }
 
+type pcapDump struct {
+	f *os.File
+	w *pcapgo.Writer
+}
+
+func newPcapDump(path string, linkType layers.LinkType) (*pcapDump, error) {
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	w := pcapgo.NewWriter(f)
+	if err := w.WriteFileHeader(65535, linkType); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return &pcapDump{f: f, w: w}, nil
+}
+
+func (d *pcapDump) writePacket(ci gopacket.CaptureInfo, data []byte) error {
+	return d.w.WritePacket(ci, data)
+}
+
+func (d *pcapDump) close() error {
+	return d.f.Close()
+}
+
 func main() {
 	cfg := parseFlags()
 
@@ -30,9 +58,22 @@ func main() {
 	}
 	defer handle.Close()
 
-	src := gopacket.NewPacketSource(handle, handle.LinkType())
+	linkType := handle.LinkType()
+	origDump, err := newPcapDump("original.pcap", linkType)
+	if err != nil {
+		log.Fatalf("open original dump: %v", err)
+	}
+	defer origDump.close()
+
+	rewDump, err := newPcapDump("rewritten.pcap", linkType)
+	if err != nil {
+		log.Fatalf("open rewritten dump: %v", err)
+	}
+	defer rewDump.close()
+
+	src := gopacket.NewPacketSource(handle, linkType)
 	for pkt := range src.Packets() {
-		if err := handlePacket(handle, cfg, pkt); err != nil {
+		if err := handlePacket(handle, cfg, pkt, origDump, rewDump); err != nil {
 			log.Printf("handle packet: %v", err)
 		}
 	}
@@ -60,14 +101,28 @@ func openHandle(cfg Config) (*pcap.Handle, error) {
 	return handle, nil
 }
 
-func handlePacket(handle *pcap.Handle, cfg Config, pkt gopacket.Packet) error {
+func handlePacket(handle *pcap.Handle, cfg Config, pkt gopacket.Packet, origDump, rewDump *pcapDump) error {
 	pktIp, ipErr := getPacketIp(pkt)
 	if ipErr != nil {
 		return fmt.Errorf("Error in retrieving ip %v", ipErr)
 	}
+
+	if err := origDump.writePacket(pkt.Metadata().CaptureInfo, pkt.Data()); err != nil {
+		return fmt.Errorf("dump original: %w", err)
+	}
+
 	rewritten, err := rewriteForDirection(cfg, pkt, pktIp)
 	if err != nil {
 		return fmt.Errorf("Error in rewite %v", err)
+	}
+
+	ci := gopacket.CaptureInfo{
+		Timestamp:     pkt.Metadata().Timestamp,
+		CaptureLength: len(rewritten),
+		Length:        len(rewritten),
+	}
+	if err := rewDump.writePacket(ci, rewritten); err != nil {
+		return fmt.Errorf("dump rewritten: %w", err)
 	}
 
 	return forward(handle, rewritten)
