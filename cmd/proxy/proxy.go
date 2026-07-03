@@ -282,6 +282,9 @@ func getMACFromARP(ip net.IP) (net.HardwareAddr, error) {
 			}
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
 	return nil, fmt.Errorf("MAC address not found in ARP table for IP %s", ipStr)
 }
 
