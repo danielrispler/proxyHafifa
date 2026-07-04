@@ -12,41 +12,57 @@ import (
 )
 
 type macCache struct {
-	mu        sync.RWMutex
-	resolveMu sync.Mutex
-	cache     map[string]net.HardwareAddr
+	mu       sync.RWMutex
+	cache    map[string]net.HardwareAddr
+	inflight map[string]bool
 }
 
 func newMacCache() *macCache {
-	return &macCache{cache: make(map[string]net.HardwareAddr)}
+	return &macCache{cache: make(map[string]net.HardwareAddr), inflight: make(map[string]bool)}
 }
 
-func (mc *macCache) Get(ip net.IP) (net.HardwareAddr, error) {
+// Get is a non-blocking cache read. On a hit it returns (mac, true). On a miss
+// it kicks off a background ARP resolve (deduped per IP) and returns (nil,
+// false); the caller drops the packet and a later one succeeds once the cache
+// warms. This keeps the single-threaded reverse pump from stalling ~10s on the
+// blocking getMACWithRetry.
+func (mc *macCache) Get(ip net.IP) (net.HardwareAddr, bool) {
 	ipStr := ip.String()
+
 	mc.mu.RLock()
 	mac, found := mc.cache[ipStr]
 	mc.mu.RUnlock()
 	if found {
-		return mac, nil
+		return mac, true
 	}
 
-	mc.resolveMu.Lock()
-	defer mc.resolveMu.Unlock()
-
-	mc.mu.RLock()
-	mac, found = mc.cache[ipStr]
-	mc.mu.RUnlock()
-	if found {
-		return mac, nil
+	mc.mu.Lock()
+	if _, ok := mc.cache[ipStr]; ok {
+		mac = mc.cache[ipStr]
+		mc.mu.Unlock()
+		return mac, true
 	}
+	if mc.inflight[ipStr] {
+		mc.mu.Unlock()
+		return nil, false
+	}
+	mc.inflight[ipStr] = true
+	mc.mu.Unlock()
 
+	go mc.resolve(ip, ipStr)
+	return nil, false
+}
+
+func (mc *macCache) resolve(ip net.IP, ipStr string) {
 	mac, err := getMACWithRetry(ip)
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+	delete(mc.inflight, ipStr)
 	if err != nil {
-		return nil, err
+		log.Printf("[Proxy] MAC resolution failed for %v: %v", ip, err)
+		return
 	}
-
-	mc.set(ip, mac)
-	return mac, nil
+	mc.cache[ipStr] = mac
 }
 
 func (mc *macCache) set(ip net.IP, mac net.HardwareAddr) {

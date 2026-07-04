@@ -32,8 +32,14 @@ func resolveContainerIP(serviceName string) net.IP {
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		ips, err := net.LookupIP(serviceName)
-		if err == nil && len(ips) > 0 {
-			return ips[0]
+		if err == nil {
+			// Pick the first IPv4 answer; an AAAA/IPv6 address can't match any
+			// of the IPv4-only code paths (interface subnets, shouldForward).
+			for _, ip := range ips {
+				if ip.To4() != nil {
+					return ip
+				}
+			}
 		}
 		if time.Now().After(deadline) {
 			log.Fatalf("[Proxy] failed to resolve IP for container %s: %v", serviceName, err)

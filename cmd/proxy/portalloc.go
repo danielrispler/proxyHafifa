@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"time"
 
@@ -19,11 +20,10 @@ func newPortAllocator(rdb *redis.Client) *portAllocator {
 
 func (pa *portAllocator) Allocate(ctx context.Context, serverIP net.IP, serverPort uint16, serverToClientVal string, ttl time.Duration) (uint16, error) {
 	for range maxAllocAttempts {
-		n, err := pa.rdb.Incr(ctx, "nat:global_port_counter").Result()
-		if err != nil {
-			return 0, fmt.Errorf("incr global port counter: %w", err)
-		}
-		port := uint16(portRangeStart + (n % portRangeSize))
+		// Random probe over the whole range: uniform sampling avoids the
+		// consecutive-cluster collisions a monotonic counter suffers when
+		// recently-used ports are still within TTL.
+		port := uint16(portRangeStart + rand.IntN(portRangeSize))
 
 		ok, err := pa.rdb.SetNX(ctx, natServerToClientKey(port, serverIP, serverPort), serverToClientVal, ttl).Result()
 		if err != nil {

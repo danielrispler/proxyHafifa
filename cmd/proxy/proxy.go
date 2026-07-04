@@ -28,6 +28,7 @@ type NATProxy struct {
 	portAlloc    *portAllocator
 	macCache     *macCache
 	conntrack    *conntrack
+	stop         chan struct{}
 }
 
 func NewNATProxy() (*NATProxy, error) {
@@ -139,10 +140,12 @@ func NewNATProxy() (*NATProxy, error) {
 		portAlloc:    newPortAllocator(rdb),
 		macCache:     mCache,
 		conntrack:    newConntrack(),
+		stop:         make(chan struct{}),
 	}, nil
 }
 
 func (p *NATProxy) Close() {
+	close(p.stop)
 	p.clientHandle.Close()
 	p.serverHandle.Close()
 	p.origDump.close()
@@ -152,6 +155,8 @@ func (p *NATProxy) Close() {
 
 func (p *NATProxy) Run() {
 	log.Printf("[Proxy] Starting packet-forwarding loops. Client interface: %s, Server interface: %s", p.cfg.clientInterface, p.cfg.serverInterface)
+
+	go p.conntrack.janitor(janitorInterval, p.stop)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -185,6 +190,13 @@ const (
 	serverToClient
 )
 
+func dirName(d direction) string {
+	if d == clientToServer {
+		return "C->S"
+	}
+	return "S->C"
+}
+
 // shouldForward reports whether a captured packet belongs to a flow this proxy
 // handles. Promiscuous capture also sees the proxy's own injected frames and
 // unrelated wire traffic; those must be ignored to avoid double-NAT and loops.
@@ -197,8 +209,11 @@ func (p *NATProxy) shouldForward(ip *layers.IPv4, dir direction) bool {
 		// Only NAT the client -> server flow.
 		return ip.DstIP.Equal(p.cfg.serverIP)
 	}
-	// server -> client: only genuine replies from the server.
-	return ip.SrcIP.Equal(p.cfg.serverIP)
+	// server -> client: only genuine replies from the server, addressed to our
+	// egress IP. Our own injected S->C frames keep SrcIP=serverIP but carry
+	// DstIP=clientIP, so requiring DstIP==proxyEgressIP excludes them and
+	// prevents a re-forward loop when client and server share an interface.
+	return ip.SrcIP.Equal(p.cfg.serverIP) && ip.DstIP.Equal(p.cfg.proxyEgressIP)
 }
 
 func (p *NATProxy) forwardPacket(pkt gopacket.Packet, dir direction, srcMAC, dstMAC net.HardwareAddr, outHandle *pcap.Handle) error {
@@ -211,6 +226,13 @@ func (p *NATProxy) forwardPacket(pkt gopacket.Packet, dir direction, srcMAC, dst
 		return nil
 	}
 
+	// A header-rewriting PAT gateway can't rewrite ports on trailing fragments;
+	// drop fragmented datagrams outright to avoid corrupting reassembly.
+	if isFragment(ip) {
+		log.Printf("[Proxy] %s dropped fragmented datagram %s -> %s", dirName(dir), ip.SrcIP, ip.DstIP)
+		return nil
+	}
+
 	if err := p.origDump.writePacket(pkt.Metadata().CaptureInfo, pkt.Data()); err != nil {
 		return fmt.Errorf("pcap original dump: %w", err)
 	}
@@ -219,8 +241,14 @@ func (p *NATProxy) forwardPacket(pkt gopacket.Packet, dir direction, srcMAC, dst
 	proto := ip.Protocol
 	now := time.Now()
 
+	var srcPort, dstPort uint16
 	if proto == layers.IPProtocolTCP || proto == layers.IPProtocolUDP {
-		srcPort, dstPort := parsePorts(pkt, proto)
+		var ok bool
+		srcPort, dstPort, ok = parsePorts(pkt, proto)
+		if !ok {
+			log.Printf("[Proxy] %s dropped %s packet with no decodable L4 header %s -> %s", dirName(dir), proto, ip.SrcIP, ip.DstIP)
+			return nil
+		}
 
 		ttl := tcpTTL
 		if proto == layers.IPProtocolUDP {
@@ -257,6 +285,8 @@ func (p *NATProxy) forwardPacket(pkt gopacket.Packet, dir direction, srcMAC, dst
 	if err := p.rewDump.writePacket(ci, rewritten); err != nil {
 		return fmt.Errorf("pcap rewritten dump: %w", err)
 	}
+
+	log.Printf("[Proxy] %s %s %s:%d -> %s:%d (%dB)", dirName(dir), proto, ip.SrcIP, srcPort, ip.DstIP, dstPort, len(rewritten))
 
 	return outHandle.WritePacketData(rewritten)
 }
@@ -298,9 +328,9 @@ func (p *NATProxy) forwardServerToClient(ip *layers.IPv4, pkt gopacket.Packet, s
 		p.refreshTTL(m.clientToServerKey, m.serverToClientKey, ttl)
 	}
 
-	clientMAC, err := p.macCache.Get(m.clientIP)
-	if err != nil {
-		log.Printf("[Proxy] server -> client packet dropped: resolve client MAC %s: %v", m.clientIP, err)
+	clientMAC, ok := p.macCache.Get(m.clientIP)
+	if !ok {
+		log.Printf("[Proxy] server -> client packet dropped: client MAC %s not yet resolved", m.clientIP)
 		return nil, nil
 	}
 
@@ -317,9 +347,9 @@ func (p *NATProxy) forwardOther(ip *layers.IPv4, pkt gopacket.Packet, dir direct
 	if dir == clientToServer {
 		rewritten, err = rewritePacket(ip, pkt, p.cfg.proxyEgressIP, ip.DstIP, 0, 0, srcMAC, p.serverMAC)
 	} else {
-		clientMAC, mErr := p.macCache.Get(p.cfg.clientIP)
-		if mErr != nil {
-			log.Printf("[Proxy] server -> client packet dropped: resolve client MAC %s: %v", p.cfg.clientIP, mErr)
+		clientMAC, ok := p.macCache.Get(p.cfg.clientIP)
+		if !ok {
+			log.Printf("[Proxy] server -> client packet dropped: client MAC %s not yet resolved", p.cfg.clientIP)
 			return nil, nil
 		}
 		rewritten, err = rewritePacket(ip, pkt, ip.SrcIP, p.cfg.clientIP, 0, 0, srcMAC, clientMAC)
@@ -358,16 +388,7 @@ func (p *NATProxy) loadOrCreateClientToServer(clientToServerKey string, srcIP ne
 		return nil, fmt.Errorf("lookup client -> server mapping: %w", err)
 	}
 
-	m := &natMapping{
-		clientToServerKey: clientToServerKey,
-		serverToClientKey: natServerToClientKey(proxyPort, dstIP, dstPort),
-		proxyPort:         proxyPort,
-		clientIP:          srcIP,
-		clientPort:        srcPort,
-		ttl:               ttl,
-		expiresAt:         now.Add(ttl),
-		lastRefresh:       now,
-	}
+	m := newNATMapping(clientToServerKey, natServerToClientKey(proxyPort, dstIP, dstPort), proxyPort, srcIP, srcPort, ttl, now)
 	p.conntrack.insert(m)
 	return m, nil
 }
@@ -398,16 +419,7 @@ func (p *NATProxy) loadServerToClient(serverToClientKey string, serverIP net.IP,
 	clientToServerKey := natClientToServerKey(clientIP, clientPort, serverIP, serverPort)
 	p.refreshTTL(clientToServerKey, serverToClientKey, ttl)
 
-	m := &natMapping{
-		clientToServerKey: clientToServerKey,
-		serverToClientKey: serverToClientKey,
-		proxyPort:         proxyPort,
-		clientIP:          clientIP,
-		clientPort:        clientPort,
-		ttl:               ttl,
-		expiresAt:         now.Add(ttl),
-		lastRefresh:       now,
-	}
+	m := newNATMapping(clientToServerKey, serverToClientKey, proxyPort, clientIP, clientPort, ttl, now)
 	p.conntrack.insert(m)
 	return m, true, nil
 }

@@ -1,0 +1,8 @@
+# Compiled proxy binary (rebuildable, ~10MB)
+/proxy
+
+# pcap capture dumps
+*.pcap
+
+# OS cruft
+.DS_Store
