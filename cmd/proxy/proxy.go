@@ -1,65 +1,20 @@
 package main
 
 import (
-	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
-	"os"
-	"strings"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
-	"github.com/google/gopacket/pcapgo"
+	"github.com/redis/go-redis/v9"
 )
-
-type Config struct {
-	clientInterface string
-	serverInterface string
-
-	clientIP      net.IP
-	serverIP      net.IP
-	proxyEgressIP net.IP
-
-	proxyClientMAC net.HardwareAddr
-	proxyServerMAC net.HardwareAddr
-
-	snapshotLen int32
-	promiscuous bool
-	timeout     time.Duration
-}
-
-type pcapDump struct {
-	mu sync.Mutex
-	f  *os.File
-	w  *pcapgo.Writer
-}
-
-func newPcapDump(path string, linkType layers.LinkType) (*pcapDump, error) {
-	f, err := os.Create(path)
-	if err != nil {
-		return nil, err
-	}
-	w := pcapgo.NewWriter(f)
-	if err := w.WriteFileHeader(65535, linkType); err != nil {
-		f.Close()
-		return nil, err
-	}
-	return &pcapDump{f: f, w: w}, nil
-}
-
-func (d *pcapDump) writePacket(ci gopacket.CaptureInfo, data []byte) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.w.WritePacket(ci, data)
-}
-
-func (d *pcapDump) close() error {
-	return d.f.Close()
-}
 
 type NATProxy struct {
 	cfg          Config
@@ -69,11 +24,16 @@ type NATProxy struct {
 	serverMAC    net.HardwareAddr
 	origDump     *pcapDump
 	rewDump      *pcapDump
+	rdb          *redis.Client
+	portAlloc    *portAllocator
+	macCache     *macCache
+	conntrack    *conntrack
 }
 
 func NewNATProxy() (*NATProxy, error) {
 	clientIP := resolveContainerIP("client")
 	serverIP := resolveContainerIP("server")
+	redisIP := resolveContainerIP("redis")
 
 	clientDev, _, err := findInterfaceForTarget(clientIP)
 	if err != nil {
@@ -118,8 +78,18 @@ func NewNATProxy() (*NATProxy, error) {
 	}
 
 	log.Printf("[Proxy] Resolving Client MAC (%s) and Server MAC (%s)...", cfg.clientIP, cfg.serverIP)
-	clientMAC := getMACWithRetry(cfg.clientIP)
-	serverMAC := getMACWithRetry(cfg.serverIP)
+	clientMAC, err := getMACWithRetry(cfg.clientIP)
+	if err != nil {
+		clientHandle.Close()
+		serverHandle.Close()
+		return nil, fmt.Errorf("resolve client MAC: %w", err)
+	}
+	serverMAC, err := getMACWithRetry(cfg.serverIP)
+	if err != nil {
+		clientHandle.Close()
+		serverHandle.Close()
+		return nil, fmt.Errorf("resolve server MAC: %w", err)
+	}
 	log.Printf("[Proxy] Resolved MACs - Client: %s, Server: %s", clientMAC, serverMAC)
 
 	origDump, err := newPcapDump("original.pcap", layers.LinkTypeEthernet)
@@ -137,6 +107,26 @@ func NewNATProxy() (*NATProxy, error) {
 		return nil, fmt.Errorf("create rewritten pcap dump: %w", err)
 	}
 
+	redisAddr := fmt.Sprintf("%s:6379", redisIP)
+	rdb := redis.NewClient(&redis.Options{
+		Addr: redisAddr,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		clientHandle.Close()
+		serverHandle.Close()
+		origDump.close()
+		rewDump.close()
+		rdb.Close()
+		return nil, fmt.Errorf("connect to redis: %w", err)
+	}
+	log.Printf("[Proxy] Redis connected")
+
+	mCache := newMacCache()
+	mCache.set(cfg.clientIP, clientMAC)
+
 	return &NATProxy{
 		cfg:          cfg,
 		clientHandle: clientHandle,
@@ -145,6 +135,10 @@ func NewNATProxy() (*NATProxy, error) {
 		serverMAC:    serverMAC,
 		origDump:     origDump,
 		rewDump:      rewDump,
+		rdb:          rdb,
+		portAlloc:    newPortAllocator(rdb),
+		macCache:     mCache,
+		conntrack:    newConntrack(),
 	}, nil
 }
 
@@ -153,6 +147,7 @@ func (p *NATProxy) Close() {
 	p.serverHandle.Close()
 	p.origDump.close()
 	p.rewDump.close()
+	p.rdb.Close()
 }
 
 func (p *NATProxy) Run() {
@@ -163,34 +158,56 @@ func (p *NATProxy) Run() {
 
 	go func() {
 		defer wg.Done()
-		src := gopacket.NewPacketSource(p.clientHandle, p.clientHandle.LinkType())
-		for pkt := range src.Packets() {
-			if err := p.forwardPacket(pkt, p.cfg.clientIP, true, p.cfg.proxyEgressIP, p.cfg.proxyServerMAC, p.serverMAC, p.serverHandle); err != nil {
-				log.Printf("[Proxy] client -> server route error: %v", err)
-			}
-		}
+		p.pump(p.clientHandle, clientToServer, p.cfg.proxyServerMAC, p.serverMAC, p.serverHandle, "client -> server")
 	}()
 
 	go func() {
 		defer wg.Done()
-		src := gopacket.NewPacketSource(p.serverHandle, p.serverHandle.LinkType())
-		for pkt := range src.Packets() {
-			if err := p.forwardPacket(pkt, p.cfg.serverIP, false, p.cfg.clientIP, p.cfg.proxyClientMAC, p.clientMAC, p.clientHandle); err != nil {
-				log.Printf("[Proxy] server -> client route error: %v", err)
-			}
-		}
+		p.pump(p.serverHandle, serverToClient, p.cfg.proxyClientMAC, nil, p.clientHandle, "server -> client")
 	}()
 
 	wg.Wait()
 }
 
-func (p *NATProxy) forwardPacket(pkt gopacket.Packet, srcFilter net.IP, modifySource bool, targetIP net.IP, srcMAC, dstMAC net.HardwareAddr, outHandle *pcap.Handle) error {
+func (p *NATProxy) pump(in *pcap.Handle, dir direction, srcMAC, dstMAC net.HardwareAddr, out *pcap.Handle, label string) {
+	src := gopacket.NewPacketSource(in, in.LinkType())
+	for pkt := range src.Packets() {
+		if err := p.forwardPacket(pkt, dir, srcMAC, dstMAC, out); err != nil {
+			log.Printf("[Proxy] %s route error: %v", label, err)
+		}
+	}
+}
+
+type direction int
+
+const (
+	clientToServer direction = iota
+	serverToClient
+)
+
+// shouldForward reports whether a captured packet belongs to a flow this proxy
+// handles. Promiscuous capture also sees the proxy's own injected frames and
+// unrelated wire traffic; those must be ignored to avoid double-NAT and loops.
+func (p *NATProxy) shouldForward(ip *layers.IPv4, dir direction) bool {
+	if dir == clientToServer {
+		// Drop our own injected replies and anything sourced from the server.
+		if ip.SrcIP.Equal(p.cfg.proxyEgressIP) || ip.SrcIP.Equal(p.cfg.serverIP) {
+			return false
+		}
+		// Only NAT the client -> server flow.
+		return ip.DstIP.Equal(p.cfg.serverIP)
+	}
+	// server -> client: only genuine replies from the server.
+	return ip.SrcIP.Equal(p.cfg.serverIP)
+}
+
+func (p *NATProxy) forwardPacket(pkt gopacket.Packet, dir direction, srcMAC, dstMAC net.HardwareAddr, outHandle *pcap.Handle) error {
 	ip, err := getIPv4Layer(pkt)
 	if err != nil || ip == nil {
 		return err
 	}
 
-	if !ip.SrcIP.Equal(srcFilter) {
+	if !p.shouldForward(ip, dir) {
 		return nil
 	}
 
@@ -198,16 +215,38 @@ func (p *NATProxy) forwardPacket(pkt gopacket.Packet, srcFilter net.IP, modifySo
 		return fmt.Errorf("pcap original dump: %w", err)
 	}
 
-	var ipField *net.IP
-	if modifySource {
-		ipField = &ip.SrcIP
-	} else {
-		ipField = &ip.DstIP
-	}
+	var rewritten []byte
+	proto := ip.Protocol
+	now := time.Now()
 
-	rewritten, err := p.rewritePacket(pkt, ipField, targetIP, srcMAC, dstMAC)
-	if err != nil {
-		return fmt.Errorf("rewrite packet: %w", err)
+	if proto == layers.IPProtocolTCP || proto == layers.IPProtocolUDP {
+		srcPort, dstPort := parsePorts(pkt, proto)
+
+		ttl := tcpTTL
+		if proto == layers.IPProtocolUDP {
+			ttl = udpTTL
+		}
+
+		if dir == clientToServer {
+			rewritten, err = p.forwardClientToServer(ip, pkt, srcPort, dstPort, ttl, now, srcMAC, dstMAC)
+		} else {
+			rewritten, err = p.forwardServerToClient(ip, pkt, srcPort, dstPort, ttl, now, srcMAC)
+		}
+		if err != nil {
+			return err
+		}
+		if rewritten == nil {
+
+			return nil
+		}
+	} else {
+		rewritten, err = p.forwardOther(ip, pkt, dir, srcMAC)
+		if err != nil {
+			return err
+		}
+		if rewritten == nil {
+			return nil
+		}
 	}
 
 	ci := gopacket.CaptureInfo{
@@ -222,127 +261,164 @@ func (p *NATProxy) forwardPacket(pkt gopacket.Packet, srcFilter net.IP, modifySo
 	return outHandle.WritePacketData(rewritten)
 }
 
-func (p *NATProxy) rewritePacket(pkt gopacket.Packet, ipField *net.IP, newIP net.IP, srcMAC, dstMAC net.HardwareAddr) ([]byte, error) {
-	*ipField = newIP
-
-	if ethLayer := pkt.Layer(layers.LayerTypeEthernet); ethLayer != nil {
-		if eth, ok := ethLayer.(*layers.Ethernet); ok {
-			eth.SrcMAC = srcMAC
-			eth.DstMAC = dstMAC
-		}
-	}
-
-	return serialize(pkt)
-}
-
-func findInterfaceForTarget(target net.IP) (string, net.IP, error) {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return "", nil, err
-	}
-	for _, iface := range ifaces {
-		addrs, err := iface.Addrs()
+func (p *NATProxy) forwardClientToServer(ip *layers.IPv4, pkt gopacket.Packet, srcPort, dstPort uint16, ttl time.Duration, now time.Time, srcMAC, dstMAC net.HardwareAddr) ([]byte, error) {
+	clientToServerKey := natClientToServerKey(ip.SrcIP, srcPort, ip.DstIP, dstPort)
+	m, found, refreshDue := p.conntrack.lookupClientToServer(clientToServerKey, now)
+	if !found {
+		var err error
+		m, err = p.loadOrCreateClientToServer(clientToServerKey, ip.SrcIP, srcPort, ip.DstIP, dstPort, ttl, now)
 		if err != nil {
-			continue
+			return nil, err
 		}
-		for _, a := range addrs {
-			if ipnet, ok := a.(*net.IPNet); ok {
-				if ipnet.IP.To4() != nil && ipnet.Contains(target) {
-					return iface.Name, ipnet.IP, nil
-				}
-			}
-		}
+	} else if refreshDue {
+		p.refreshTTL(m.clientToServerKey, m.serverToClientKey, ttl)
 	}
-	return "", nil, fmt.Errorf("no interface found in subnet of target IP %v", target)
-}
 
-func triggerARP(ip net.IP) {
-	conn, err := net.Dial("udp", ip.String()+":9")
-	if err == nil {
-		_, _ = conn.Write([]byte{0})
-		_ = conn.Close()
-	}
-}
-
-func getMACFromARP(ip net.IP) (net.HardwareAddr, error) {
-	f, err := os.Open("/proc/net/arp")
+	rewritten, err := rewritePacket(ip, pkt, p.cfg.proxyEgressIP, ip.DstIP, m.proxyPort, dstPort, srcMAC, dstMAC)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("rewrite client -> server packet: %w", err)
 	}
-	defer f.Close()
-
-	ipStr := ip.String()
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) >= 4 && fields[0] == ipStr && fields[2] == "0x2" {
-			mac, err := net.ParseMAC(fields[3])
-			if err == nil {
-				return mac, nil
-			}
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return nil, fmt.Errorf("MAC address not found in ARP table for IP %s", ipStr)
+	return rewritten, nil
 }
 
-func getMACWithRetry(ip net.IP) net.HardwareAddr {
-	for i := range 20 {
-		mac, err := getMACFromARP(ip)
-		if err == nil {
-			return mac
+func (p *NATProxy) forwardServerToClient(ip *layers.IPv4, pkt gopacket.Packet, srcPort, dstPort uint16, ttl time.Duration, now time.Time, srcMAC net.HardwareAddr) ([]byte, error) {
+	serverToClientKey := natServerToClientKey(dstPort, ip.SrcIP, srcPort)
+	m, found, refreshDue := p.conntrack.lookupServerToClient(serverToClientKey, now)
+	if !found {
+		var err error
+		m, found, err = p.loadServerToClient(serverToClientKey, ip.SrcIP, srcPort, dstPort, ttl, now)
+		if err != nil {
+			return nil, err
 		}
-		log.Printf("[Proxy] resolving MAC for %v (attempt %d/20)...", ip, i+1)
-		triggerARP(ip)
-		time.Sleep(500 * time.Millisecond)
+		if !found {
+			log.Printf("[Proxy] warning: unsolicited packet dropped: no server -> client NAT mapping for %s:%d -> %s:%d", ip.SrcIP, srcPort, ip.DstIP, dstPort)
+			return nil, nil
+		}
+	} else if refreshDue {
+		p.refreshTTL(m.clientToServerKey, m.serverToClientKey, ttl)
 	}
-	panic(fmt.Sprintf("[Proxy] failed to resolve MAC address for %v", ip))
-}
 
-func getIPv4Layer(pkt gopacket.Packet) (*layers.IPv4, error) {
-	ipLayer := pkt.Layer(layers.LayerTypeIPv4)
-	if ipLayer == nil {
+	clientMAC, err := p.macCache.Get(m.clientIP)
+	if err != nil {
+		log.Printf("[Proxy] server -> client packet dropped: resolve client MAC %s: %v", m.clientIP, err)
 		return nil, nil
 	}
-	ip, ok := ipLayer.(*layers.IPv4)
-	if !ok {
-		return nil, fmt.Errorf("IPv4 layer type assertion failed")
+
+	rewritten, err := rewritePacket(ip, pkt, ip.SrcIP, m.clientIP, srcPort, m.clientPort, srcMAC, clientMAC)
+	if err != nil {
+		return nil, fmt.Errorf("rewrite server -> client packet: %w", err)
 	}
-	return ip, nil
+	return rewritten, nil
 }
 
-func serialize(pkt gopacket.Packet) ([]byte, error) {
-	if netLayer := pkt.NetworkLayer(); netLayer != nil {
-		switch t := pkt.TransportLayer().(type) {
-		case *layers.TCP:
-			t.SetNetworkLayerForChecksum(netLayer)
-		case *layers.UDP:
-			t.SetNetworkLayerForChecksum(netLayer)
+func (p *NATProxy) forwardOther(ip *layers.IPv4, pkt gopacket.Packet, dir direction, srcMAC net.HardwareAddr) ([]byte, error) {
+	var rewritten []byte
+	var err error
+	if dir == clientToServer {
+		rewritten, err = rewritePacket(ip, pkt, p.cfg.proxyEgressIP, ip.DstIP, 0, 0, srcMAC, p.serverMAC)
+	} else {
+		clientMAC, mErr := p.macCache.Get(p.cfg.clientIP)
+		if mErr != nil {
+			log.Printf("[Proxy] server -> client packet dropped: resolve client MAC %s: %v", p.cfg.clientIP, mErr)
+			return nil, nil
 		}
+		rewritten, err = rewritePacket(ip, pkt, ip.SrcIP, p.cfg.clientIP, 0, 0, srcMAC, clientMAC)
 	}
-
-	buf := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
-
-	if err := gopacket.SerializePacket(buf, opts, pkt); err != nil {
-		return nil, err
+	if err != nil {
+		return nil, fmt.Errorf("rewrite non-TCP/UDP packet: %w", err)
 	}
-
-	return buf.Bytes(), nil
+	return rewritten, nil
 }
 
-func resolveContainerIP(serviceName string) net.IP {
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		ips, err := net.LookupIP(serviceName)
-		if err == nil && len(ips) > 0 {
-			return ips[0]
+func (p *NATProxy) loadOrCreateClientToServer(clientToServerKey string, srcIP net.IP, srcPort uint16, dstIP net.IP, dstPort uint16, ttl time.Duration, now time.Time) (*natMapping, error) {
+	ctx, cancel := redisCtx()
+	defer cancel()
+
+	var proxyPort uint16
+	val, err := p.rdb.Get(ctx, clientToServerKey).Result()
+	switch {
+	case err == nil:
+		portVal, perr := strconv.ParseUint(val, 10, 16)
+		if perr != nil {
+			return nil, fmt.Errorf("parse proxy port %q: %w", val, perr)
 		}
-		if time.Now().After(deadline) {
-			log.Fatalf("[Proxy] failed to resolve IP for container %s: %v", serviceName, err)
+		proxyPort = uint16(portVal)
+		p.refreshTTL(clientToServerKey, natServerToClientKey(proxyPort, dstIP, dstPort), ttl)
+	case errors.Is(err, redis.Nil):
+		serverToClientVal := net.JoinHostPort(srcIP.String(), strconv.Itoa(int(srcPort)))
+		proxyPort, err = p.portAlloc.Allocate(ctx, dstIP, dstPort, serverToClientVal, ttl)
+		if err != nil {
+			return nil, fmt.Errorf("allocate port: %w", err)
 		}
-		time.Sleep(500 * time.Millisecond)
+
+		if err := p.rdb.Set(ctx, clientToServerKey, strconv.Itoa(int(proxyPort)), ttl).Err(); err != nil {
+			return nil, fmt.Errorf("store client -> server NAT mapping: %w", err)
+		}
+	default:
+		return nil, fmt.Errorf("lookup client -> server mapping: %w", err)
+	}
+
+	m := &natMapping{
+		clientToServerKey: clientToServerKey,
+		serverToClientKey: natServerToClientKey(proxyPort, dstIP, dstPort),
+		proxyPort:         proxyPort,
+		clientIP:          srcIP,
+		clientPort:        srcPort,
+		ttl:               ttl,
+		expiresAt:         now.Add(ttl),
+		lastRefresh:       now,
+	}
+	p.conntrack.insert(m)
+	return m, nil
+}
+
+func (p *NATProxy) loadServerToClient(serverToClientKey string, serverIP net.IP, serverPort uint16, proxyPort uint16, ttl time.Duration, now time.Time) (*natMapping, bool, error) {
+	ctx, cancel := redisCtx()
+	defer cancel()
+
+	val, err := p.rdb.Get(ctx, serverToClientKey).Result()
+	if errors.Is(err, redis.Nil) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("lookup server -> client mapping: %w", err)
+	}
+
+	host, portStr, err := net.SplitHostPort(val)
+	if err != nil {
+		return nil, false, fmt.Errorf("invalid server -> client mapping %q: %w", val, err)
+	}
+	clientIP := net.ParseIP(host)
+	clientPortVal, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil || clientIP == nil {
+		return nil, false, fmt.Errorf("invalid client addr in server -> client mapping %q", val)
+	}
+	clientPort := uint16(clientPortVal)
+
+	clientToServerKey := natClientToServerKey(clientIP, clientPort, serverIP, serverPort)
+	p.refreshTTL(clientToServerKey, serverToClientKey, ttl)
+
+	m := &natMapping{
+		clientToServerKey: clientToServerKey,
+		serverToClientKey: serverToClientKey,
+		proxyPort:         proxyPort,
+		clientIP:          clientIP,
+		clientPort:        clientPort,
+		ttl:               ttl,
+		expiresAt:         now.Add(ttl),
+		lastRefresh:       now,
+	}
+	p.conntrack.insert(m)
+	return m, true, nil
+}
+
+func (p *NATProxy) refreshTTL(clientToServerKey, serverToClientKey string, ttl time.Duration) {
+	ctx, cancel := redisCtx()
+	defer cancel()
+	pipe := p.rdb.Pipeline()
+	pipe.Expire(ctx, clientToServerKey, ttl)
+	pipe.Expire(ctx, serverToClientKey, ttl)
+	if _, err := pipe.Exec(ctx); err != nil {
+		log.Printf("[Proxy] failed to refresh TTL: %v", err)
 	}
 }
