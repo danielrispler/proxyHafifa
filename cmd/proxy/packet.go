@@ -8,9 +8,6 @@ import (
 	"github.com/google/gopacket/layers"
 )
 
-// parsePorts extracts L4 ports. ok is false when the transport layer did not
-// decode (non-first fragment, truncated capture) — the caller must drop such
-// packets rather than build a bogus port-0 mapping.
 func parsePorts(pkt gopacket.Packet, proto layers.IPProtocol) (srcPort, dstPort uint16, ok bool) {
 	switch proto {
 	case layers.IPProtocolTCP:
@@ -29,9 +26,6 @@ func parsePorts(pkt gopacket.Packet, proto layers.IPProtocol) (srcPort, dstPort 
 	return 0, 0, false
 }
 
-// isFragment reports whether the datagram is fragmented (first or trailing).
-// A header-rewriting PAT gateway cannot rewrite ports on trailing fragments, so
-// fragmented datagrams are dropped outright.
 func isFragment(ip *layers.IPv4) bool {
 	return ip.Flags&layers.IPv4MoreFragments != 0 || ip.FragOffset != 0
 }

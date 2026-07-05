@@ -1,6 +1,5 @@
 FROM golang:1.26-alpine AS build
 WORKDIR /app
-# gopacket binds libpcap via cgo.
 RUN apk add --no-cache libpcap-dev gcc musl-dev
 ENV CGO_ENABLED=1
 COPY go.mod go.sum ./
@@ -9,7 +8,6 @@ COPY . .
 RUN go build -o /svc ./cmd/proxy
 
 FROM alpine:latest
-# libpcap: runtime for capture/inject. iptables: entrypoint RST-drop rule.
 RUN apk add --no-cache libpcap iptables
 COPY --from=build /svc /svc
 COPY build/proxy-entrypoint.sh /entrypoint.sh

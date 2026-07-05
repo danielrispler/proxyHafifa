@@ -14,7 +14,7 @@ var words = []string{
 }
 
 func randomText() string {
-	n := 3 + rand.Intn(5) // 3..7 words
+	n := 3 + rand.Intn(5)
 	parts := make([]string, n)
 	for i := range parts {
 		parts[i] = words[rand.Intn(len(words))]

@@ -37,18 +37,21 @@ func natServerToClientKey(port uint16, dstIP net.IP, dstPort uint16) string {
 type natMapping struct {
 	clientToServerKey, serverToClientKey string
 	proxyPort                            uint16
-	clientIP                             net.IP
-	clientPort                           uint16
-	ttl                                  time.Duration
-	expiresAt                            time.Time
-	lastRefresh                          time.Time
+
+	serverIP    net.IP
+	clientIP    net.IP
+	clientPort  uint16
+	ttl         time.Duration
+	expiresAt   time.Time
+	lastRefresh time.Time
 }
 
-func newNATMapping(c2sKey, s2cKey string, proxyPort uint16, clientIP net.IP, clientPort uint16, ttl time.Duration, now time.Time) *natMapping {
+func newNATMapping(c2sKey, s2cKey string, proxyPort uint16, serverIP, clientIP net.IP, clientPort uint16, ttl time.Duration, now time.Time) *natMapping {
 	return &natMapping{
 		clientToServerKey: c2sKey,
 		serverToClientKey: s2cKey,
 		proxyPort:         proxyPort,
+		serverIP:          serverIP,
 		clientIP:          clientIP,
 		clientPort:        clientPort,
 		ttl:               ttl,
@@ -88,8 +91,6 @@ func (ct *conntrack) drop(m *natMapping) {
 	delete(ct.serverToClient, m.serverToClientKey)
 }
 
-// lookup finds a live mapping by key in the given map, evicting it if expired.
-// Returns (mapping, found, refreshDue). Caller must not hold ct.mu.
 func (ct *conntrack) lookup(m map[string]*natMapping, key string, now time.Time) (*natMapping, bool, bool) {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
@@ -112,8 +113,6 @@ func (ct *conntrack) lookupServerToClient(key string, now time.Time) (*natMappin
 	return ct.lookup(ct.serverToClient, key, now)
 }
 
-// sweep drops every mapping whose TTL has expired. Silent flows never trigger a
-// same-key lookup, so without this they would leak until the process OOMs.
 func (ct *conntrack) sweep(now time.Time) {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
@@ -124,7 +123,6 @@ func (ct *conntrack) sweep(now time.Time) {
 	}
 }
 
-// janitor periodically sweeps expired mappings until stop is closed.
 func (ct *conntrack) janitor(interval time.Duration, stop <-chan struct{}) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

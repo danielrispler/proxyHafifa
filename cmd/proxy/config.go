@@ -9,8 +9,11 @@ type Config struct {
 	clientInterface string
 	serverInterface string
 
-	clientIP      net.IP
-	serverIP      net.IP
+	clientIP net.IP
+
+	serverIP net.IP
+
+	backendIPs    []net.IP
 	proxyEgressIP net.IP
 
 	proxyClientMAC net.HardwareAddr

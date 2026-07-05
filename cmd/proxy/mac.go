@@ -21,11 +21,6 @@ func newMacCache() *macCache {
 	return &macCache{cache: make(map[string]net.HardwareAddr), inflight: make(map[string]bool)}
 }
 
-// Get is a non-blocking cache read. On a hit it returns (mac, true). On a miss
-// it kicks off a background ARP resolve (deduped per IP) and returns (nil,
-// false); the caller drops the packet and a later one succeeds once the cache
-// warms. This keeps the single-threaded reverse pump from stalling ~10s on the
-// blocking getMACWithRetry.
 func (mc *macCache) Get(ip net.IP) (net.HardwareAddr, bool) {
 	ipStr := ip.String()
 

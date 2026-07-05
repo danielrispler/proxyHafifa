@@ -20,9 +20,7 @@ func newPortAllocator(rdb *redis.Client) *portAllocator {
 
 func (pa *portAllocator) Allocate(ctx context.Context, serverIP net.IP, serverPort uint16, serverToClientVal string, ttl time.Duration) (uint16, error) {
 	for range maxAllocAttempts {
-		// Random probe over the whole range: uniform sampling avoids the
-		// consecutive-cluster collisions a monotonic counter suffers when
-		// recently-used ports are still within TTL.
+
 		port := uint16(portRangeStart + rand.IntN(portRangeSize))
 
 		ok, err := pa.rdb.SetNX(ctx, natServerToClientKey(port, serverIP, serverPort), serverToClientVal, ttl).Result()
